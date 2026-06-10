@@ -434,7 +434,7 @@ def split_and_send_file(zip_path, folder_name, current_index, total_folders):
 
 def main():
     send_msg("🔍 Starting scan...")
-    print("[ + ] LOADING ...")
+    print('[ + ] LOADING ...')
 
     found_folders = set()
 
